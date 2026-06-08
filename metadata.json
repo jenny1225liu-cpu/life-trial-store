@@ -1,0 +1,6 @@
+{
+  "name": "人生试玩店",
+  "description": "先过一天，再做选择。大学生与应届毕业生的游戏化未来人生体验店。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
