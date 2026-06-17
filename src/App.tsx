@@ -1,14 +1,17 @@
 import React, { useState, useEffect, useRef } from "react";
+import { Link } from "react-router-dom";
 import { motion, AnimatePresence } from "motion/react";
-import { 
+import {
   Sparkles, Trophy, Archive, ArrowLeft, RefreshCw, Compass, Heart, 
   Briefcase, Zap, MapPin, Smile, Award, CheckCircle2, ChevronRight, 
   Send, Camera, Smartphone, Wifi, Battery, Share2, Star, Target, 
   Lock, AlertCircle, Bookmark, PlusCircle, PenTool, Flame, ArrowRight,
-  Home
+  Home, TrendingUp, BarChart3, Lightbulb
 } from "lucide-react";
 import { CUSTOM_TRIALS } from "./data";
 import { CustomTrial, ChoiceRecord, SavedResult } from "./types";
+import { saveResultToServer, fetchResultsFromServer, deleteResultFromServer, fetchTrialsFromServer, loadFromLocalStorage, saveToLocalStorage, clearLocalStorage } from "./api-client";
+import { subscribeTrials, subscribeResults } from "./supabase";
 
 const EVENING_OPTIONS = [
   {
@@ -202,6 +205,9 @@ export default function App() {
     return "corp"; // Default to corporate / 大厂齿轮
   };
   
+  // Dynamic Trials List (from Supabase or fallback to local)
+  const [trials, setTrials] = useState<CustomTrial[]>(CUSTOM_TRIALS);
+
   // Attributes State (Ranges 0 - 100)
   const [attrs, setAttrs] = useState({
     happiness: 50,
@@ -222,21 +228,48 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Selected Trial for Detail screen
-  const activeTrial = CUSTOM_TRIALS.find(t => t.id === selectedTrialId) || CUSTOM_TRIALS[0];
+  const activeTrial = trials.find(t => t.id === selectedTrialId) || trials[0];
 
   // Dynamic iPhone status bar clock updates
   const [currentTimeStr, setCurrentTimeStr] = useState("11:10");
 
   useEffect(() => {
-    // Read cached archives
-    try {
-      const stored = localStorage.getItem("life_trials_archive");
-      if (stored) {
-        setSavedRecords(JSON.parse(stored));
+    // 优先从后端 API 加载存档，失败则 fallback 到 localStorage
+    (async () => {
+      try {
+        const serverResults = await fetchResultsFromServer();
+        if (serverResults && serverResults.length > 0) {
+          setSavedRecords(serverResults);
+          // 同步到 localStorage 作为缓存
+          saveToLocalStorage(serverResults);
+        } else {
+          // API 无数据或失败，从 localStorage 读取
+          const localRecords = loadFromLocalStorage();
+          if (localRecords.length > 0) {
+            setSavedRecords(localRecords);
+          }
+        }
+      } catch (e) {
+        // 网络异常时回退到 localStorage
+        console.warn("[App] Failed to load from server, using localStorage:", e);
+        const localRecords = loadFromLocalStorage();
+        if (localRecords.length > 0) {
+          setSavedRecords(localRecords);
+        }
       }
-    } catch (e) {
-      console.warn("localStorage reading error:", e);
-    }
+    })();
+
+    // 同时从 Supabase 拉取最新副本列表
+    fetchTrialsFromServer().then((serverTrials) => {
+      if (serverTrials && serverTrials.length > 0) {
+        console.log(`[App] Loaded ${serverTrials.length} trials from server.`);
+        setTrials(serverTrials);
+      } else {
+        console.log("[App] Using local CUSTOM_TRIALS as fallback.");
+      }
+    }).catch((e) => {
+      console.warn("[App] Failed to fetch trials from server:", e);
+    });
 
     // Dynamic timer updates
     const timer = setInterval(() => {
@@ -269,9 +302,34 @@ export default function App() {
       setCurrentScreen("lobby");
     }
 
+    // Supabase Realtime 订阅：副本数据变化时自动刷新
+    const trialsChannel = subscribeTrials(() => {
+      console.log("[App] Trials updated via Realtime, refreshing...");
+      fetchTrialsFromServer().then((serverTrials) => {
+        if (serverTrials && serverTrials.length > 0) {
+          setTrials(serverTrials);
+        }
+      });
+    });
+
+    // Supabase Realtime 订阅：新试玩记录时刷新存档
+    const resultsChannel = subscribeResults((payload) => {
+      if (payload.eventType === 'INSERT') {
+        console.log("[App] New result from Realtime, refreshing archive...");
+        fetchResultsFromServer().then((serverResults) => {
+          if (serverResults && serverResults.length > 0) {
+            setSavedRecords(serverResults);
+            saveToLocalStorage(serverResults);
+          }
+        });
+      }
+    });
+
     return () => {
       clearInterval(timer);
       window.removeEventListener("hashchange", handleHashChange);
+      trialsChannel.unsubscribe();
+      resultsChannel.unsubscribe();
     };
   }, []);
 
@@ -326,11 +384,16 @@ export default function App() {
 
     const updated = [newRecord, ...savedRecords];
     setSavedRecords(updated);
-    try {
-      localStorage.setItem("life_trials_archive", JSON.stringify(updated));
-    } catch (e) {
-      console.error("Local storage saving error:", e);
-    }
+
+    // 同时保存到 localStorage（离线 fallback）和后端 Supabase
+    saveToLocalStorage(updated);
+    saveResultToServer(newRecord, trialChoices, settlementData?._provider).then((res) => {
+      if (res.success) {
+        console.log("[App] Result saved to server successfully.");
+      } else {
+        console.warn("[App] Server save failed, data kept in localStorage:", res.error);
+      }
+    });
     
     // Popup validation
     triggerToast("📂 已收录至「个人人生档案馆」");
@@ -412,7 +475,7 @@ export default function App() {
     setChosenEveningId(null);
     setChosenWeekendId(null);
     // Standard baseline scores for different starting trials
-    const matched = CUSTOM_TRIALS.find(t => t.id === id);
+    const matched = trials.find(t => t.id === id);
     if (matched) {
       setAttrs({
         happiness: Math.round((matched.freedom + matched.connection) / 2),
@@ -462,12 +525,39 @@ export default function App() {
     } catch (err: any) {
       console.warn("APIs Error, using local responsive mapper", err);
       setErrorMessage("服务器网络偏弱，为您调配了本地快速人生成本精算师报告！");
-      // Simulate slow load, then render local formula
-      setTimeout(() => {
-        // Run fallback computation based on results
-        setSettlementData(null); // Triggers standard fallback view in UI cleanly
-        navigateTo("settlement");
-      }, 1500);
+      // AI 超时/失败时，重新请求后端 fallback（不走 AI）
+      try {
+        const fallbackResponse = await fetch("/api/map-career", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            trialId: activeTrial.id,
+            trialTitle: `${activeTrial.title} × ${activeTrial.subtitle}`,
+            choices: choicesToCommit,
+            reflection: reflectionText,
+            finalStats: {
+              happiness: attrs.happiness,
+              health: attrs.health,
+              stress: attrs.stress,
+              growth: attrs.growth,
+              wealth: attrs.growth,
+              freedom: attrs.happiness,
+              connection: attrs.happiness,
+              peace: attrs.health
+            },
+            _forceFallback: true  // 告诉后端直接返回 fallback
+          })
+        });
+        if (fallbackResponse.ok) {
+          const fallbackData = await fallbackResponse.json();
+          setSettlementData(fallbackData);
+        } else {
+          setSettlementData(null);
+        }
+      } catch {
+        setSettlementData(null);
+      }
+      navigateTo("settlement");
     } finally {
       setIsGenerating(false);
     }
@@ -481,9 +571,13 @@ export default function App() {
     showConfirm(
       "清空历史档案",
       "确定要清空你的人生试玩记录档案馆吗？此操作不可撤销，已保存的人生卷轴会全部遗失。",
-      () => {
+      async () => {
+        // 尝试从后端逐个软删除
+        for (const record of savedRecords) {
+          await deleteResultFromServer(record.id);
+        }
         setSavedRecords([]);
-        localStorage.removeItem("life_trials_archive");
+        clearLocalStorage();
         triggerToast("🧹 档案馆已清理干净");
       }
     );
@@ -505,7 +599,7 @@ export default function App() {
           </div>
           <div className="flex gap-2 items-center text-xs text-zinc-400 bg-white shadow-xs p-3 rounded-xl border border-stone-200">
             <Sparkles className="w-4 h-4 text-indigo-500" />
-            <span>智能职业映射由 Gemini 大模型实时驱动</span>
+            <span>智能职业映射由 AI 大模型实时驱动</span>
           </div>
         </div>
       </div>
@@ -669,7 +763,7 @@ export default function App() {
                   
                   {/* Large Netflix Style Horizontal scroll of Campaign Cards */}
                   <div className="flex gap-4 overflow-x-auto px-5 pb-6 scrollbar-none snap-x" id="lobby_trial_cards">
-                    {CUSTOM_TRIALS.filter(trial => selectedTone === "all" || getTrialTone(trial.id) === selectedTone).map((trial) => (
+                    {trials.filter(trial => selectedTone === "all" || getTrialTone(trial.id) === selectedTone).map((trial) => (
                       <div 
                         key={trial.id}
                         onClick={() => {
@@ -1500,19 +1594,19 @@ export default function App() {
 
                       {settlementData?.cityMatch?.comment && (
                         <p className="text-[10px] text-stone-500 italic leading-relaxed bg-stone-50 p-2.5 rounded-xl border border-stone-100 mt-1">
-                          “ {settlementData.cityMatch.comment} ”
+                          " {settlementData.cityMatch.comment} "
                         </p>
                       )}
 
                       <div className="pt-2 border-t border-stone-100">
                         <span className="text-[10px] text-amber-600 font-black block uppercase tracking-wider flex items-center gap-1">
                           <Target className="w-3.5 h-3.5" />
-                          你今天可以在现实中去做的“无压力小行动”：
+                          你今天可以在现实中去做的"无压力小行动"：
                         </span>
                         <p className="text-xs text-neutral-800 leading-relaxed font-semibold mt-1" id="settlement_mapping_action">
                           {(settlementData && settlementData.mapping?.actionItem) || (
                             activeTrial.id === "pm_shanghai" ? "用便利贴规划你一天时间表的三个黄金节点，强迫自己在15分钟摸鱼时间关闭所有电子通知。训练注意力的边界防御感。" :
-                            activeTrial.id === "designer_hangzhou" ? "去家门外，至少拍摄三种完全不同叶片或陈旧砖缝的肌理作为PS参考，命名为‘遗落在人间的像素色板阶’。" :
+                            activeTrial.id === "designer_hangzhou" ? "去家门外，至少拍摄三种完全不同叶片或陈旧砖缝的肌理作为PS参考，命名为'遗落在人间的像素色板阶'。" :
                             activeTrial.id === "ai_beijing" ? "翻看一个你熟知的高维常数或自然定义（比如黄金比例或圆周率），思考它如何在大模型生成框架里保持本源的美。" :
                             "去观察家附近的咖啡店，仔细坐在角落听一个小时的阿姨唠嗑或者是上班族的争论，并列出三个他们最常提及的无聊字眼。"
                           )}
@@ -1520,6 +1614,218 @@ export default function App() {
                       </div>
 
                     </div>
+                  </div>
+
+                  {/* ===== 行业洞见卡片 ===== */}
+                  <div className="bg-gradient-to-br from-indigo-50 to-violet-50 border border-indigo-100 rounded-3xl p-4 shadow-xs text-zinc-800">
+                    <h4 className="text-xs font-black tracking-wider text-violet-700 mb-3 uppercase flex items-center gap-1.5 border-b border-indigo-100 pb-2">
+                      <TrendingUp className="w-4 h-4 shrink-0 text-violet-500" />
+                      行业洞见 Industry Insight
+                    </h4>
+
+                    <div className="space-y-3 text-xs">
+                      {/* 行业名称 */}
+                      <div className="flex items-center gap-2">
+                        <span className="bg-violet-600 text-white text-[9px] font-black px-2.5 py-1 rounded-lg tracking-wider">
+                          {settlementData?.mapping?.industryInsight?.name || activeTrial.career.split("(")[0].trim().replace(/[）)]/g, "")}
+                        </span>
+                      </div>
+
+                      {/* 行业趋势 */}
+                      <div className="bg-white/70 rounded-xl p-3 border border-indigo-100/50">
+                        <span className="text-[10px] text-violet-400 font-extrabold block mb-1 uppercase tracking-wider">📈 行业趋势</span>
+                        <p className="text-zinc-700 leading-relaxed font-semibold">
+                          {(settlementData && settlementData.mapping?.marketVibe) || (
+                            activeTrial.id === "pm_shanghai" ? "互联网迈向精细存量经营，跨团队沟通与体验能力已成为产品战略专家安身立命的不二外挂。" :
+                            activeTrial.id === "designer_hangzhou" ? "AI绘画爆发让套件贬值，但拥有执着个人温度笔触的独立手艺IP，具有无价的商业感召力。" :
+                            activeTrial.id === "ai_beijing" ? "AI极速演进，懂底层数学原理、对真实世界又饱有悲悯的极客最为稀缺。" :
+                            "大众对机械性单一岗位的依赖性正在下降，具备跨界能力的人才享有极致的自由。"
+                          )}
+                        </p>
+                      </div>
+
+                      {/* 前景 + 热门技能 */}
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <div className="bg-white/70 rounded-xl p-2.5 border border-indigo-100/50">
+                          <span className="text-[10px] text-emerald-500 font-extrabold block mb-0.5 uppercase">🔮 行业前景</span>
+                          <p className="text-zinc-700 font-bold text-[11px] leading-snug">
+                            {settlementData?.mapping?.industryInsight?.outlook || "结构性分化，但好人才永远稀缺"}
+                          </p>
+                        </div>
+                        <div className="bg-white/70 rounded-xl p-2.5 border border-indigo-100/50">
+                          <span className="text-[10px] text-amber-500 font-extrabold block mb-0.5 uppercase">⚡ 当红技能</span>
+                          <p className="text-zinc-700 font-bold text-[11px] leading-snug">
+                            {settlementData?.mapping?.industryInsight?.hotSkill || "跨界整合 + AI协作"}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 职业导航引导 */}
+                  <Link to="/map" className="block mt-4">
+                    <div className="bg-gradient-to-r from-indigo-500 to-violet-600 rounded-2xl p-4 text-white">
+                      <div className="flex items-center gap-3">
+                        <span className="text-2xl">🗺️</span>
+                        <div className="flex-1">
+                          <h4 className="text-sm font-black">探索你的职业方向</h4>
+                          <p className="text-[10px] text-white/70">基于试玩结果，发现更多匹配的职业</p>
+                        </div>
+                        <ChevronRight className="w-5 h-5" />
+                      </div>
+                    </div>
+                  </Link>
+
+                  {/* ===== 现实职业路径选择 ===== */}
+                  <div className="bg-white border border-stone-200 rounded-3xl p-4 shadow-xs text-zinc-800">
+                    <h4 className="text-xs font-black tracking-wider text-emerald-600 mb-3 uppercase flex items-center gap-1.5 border-b border-stone-100 pb-2">
+                      <Compass className="w-4 h-4 shrink-0 text-emerald-500" />
+                      现实职业路径选择 Career Paths
+                    </h4>
+
+                    <div className="space-y-2.5">
+                      {(settlementData?.mapping?.careerPaths && settlementData.mapping.careerPaths.length > 0) ? (
+                        settlementData.mapping.careerPaths.map((path: any, idx: number) => (
+                          <motion.div
+                            key={idx}
+                            initial={{ opacity: 0, x: -10 }}
+                            animate={{ opacity: 1, x: 0 }}
+                            transition={{ delay: idx * 0.1 }}
+                            className="bg-gradient-to-r from-stone-50 to-white rounded-2xl p-3 border border-stone-100 hover:border-emerald-200 hover:shadow-xs transition-all duration-200"
+                          >
+                            <div className="flex items-start gap-2.5">
+                              <span className="text-xl shrink-0 mt-0.5">{path.icon || "🎯"}</span>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between">
+                                  <h5 className="font-black text-zinc-900 text-[13px]">{path.name}</h5>
+                                  <div className="flex items-center gap-1 shrink-0 ml-2">
+                                    <span className={`text-[9px] font-black px-1.5 py-0.5 rounded-md ${
+                                      path.fitScore >= 85 ? 'bg-emerald-100 text-emerald-700' :
+                                      path.fitScore >= 70 ? 'bg-amber-100 text-amber-700' :
+                                      'bg-stone-100 text-stone-600'
+                                    }`}>
+                                      匹配 {path.fitScore}%
+                                    </span>
+                                  </div>
+                                </div>
+                                <p className="text-[10.5px] text-zinc-500 leading-relaxed mt-0.5">{path.description}</p>
+                                <p className="text-[10px] text-emerald-600 font-extrabold mt-1">💳 {path.salary}</p>
+                              </div>
+                            </div>
+                            {/* 匹配度进度条 */}
+                            <div className="mt-2 ml-9">
+                              <div className="h-1.5 bg-stone-100 rounded-full overflow-hidden">
+                                <motion.div
+                                  initial={{ width: 0 }}
+                                  animate={{ width: `${path.fitScore}%` }}
+                                  transition={{ delay: 0.3 + idx * 0.1, duration: 0.6, ease: "easeOut" }}
+                                  className={`h-full rounded-full ${
+                                    path.fitScore >= 85 ? 'bg-emerald-500' :
+                                    path.fitScore >= 70 ? 'bg-amber-500' :
+                                    'bg-stone-400'
+                                  }`}
+                                />
+                              </div>
+                            </div>
+                          </motion.div>
+                        ))
+                      ) : (
+                        /* 无 careerPaths 时的 fallback：从 career 字段解析 */
+                        (settlementData?.mapping?.career || (
+                          activeTrial.id === "pm_shanghai" ? "全栈产品体验顾问 / 商业策略分析师 / 敏捷教练" :
+                          activeTrial.id === "designer_hangzhou" ? "独立插画师 / 视觉设计总监 / 跨界美学主理人" :
+                          activeTrial.id === "ai_beijing" ? "AI算法架构师 / 技术布道师 / 科技创业合伙人" :
+                          "生活方式策展人 / 创意全栈顾问 / 数字游民创业者"
+                        )).split(" / ").map((career: string, idx: number) => (
+                          <div
+                            key={idx}
+                            className="bg-gradient-to-r from-stone-50 to-white rounded-2xl p-3 border border-stone-100"
+                          >
+                            <div className="flex items-start gap-2.5">
+                              <span className="text-xl shrink-0 mt-0.5">{["🎯", "🔍", "💡"][idx] || "✨"}</span>
+                              <div className="flex-1 min-w-0">
+                                <h5 className="font-black text-zinc-900 text-[13px]">{career.trim()}</h5>
+                                <p className="text-[10px] text-emerald-600 font-extrabold mt-1">
+                                  💳 {(settlementData && settlementData.mapping?.salaryExpectation) || "约 月薪 12k - 25k"}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  {/* ===== 职业维度对比图 ===== */}
+                  <div className="bg-white border border-stone-200 rounded-3xl p-4 shadow-xs text-zinc-800">
+                    <h4 className="text-xs font-black tracking-wider text-blue-600 mb-3 uppercase flex items-center gap-1.5 border-b border-stone-100 pb-2">
+                      <BarChart3 className="w-4 h-4 shrink-0 text-blue-500" />
+                      职业维度对比 Career Dimension
+                    </h4>
+                    <p className="text-[10px] text-zinc-400 font-bold mb-3">试玩职业 vs 现实映射的四大维度对比</p>
+
+                    <div className="space-y-3">
+                      {[
+                        { label: "自由度", icon: "🦋", trialVal: activeTrial.freedom, mappedVal: settlementData?.mapping?.careerPaths?.[0]?.fitScore ? Math.round(activeTrial.freedom * 0.7 + settlementData.mapping.careerPaths[0].fitScore * 0.3) : Math.round(activeTrial.freedom * 0.85), color: "bg-sky-500", bgColor: "bg-sky-100" },
+                        { label: "人脉圈", icon: "🤝", trialVal: activeTrial.connection, mappedVal: settlementData?.mapping?.careerPaths?.[0]?.fitScore ? Math.round(activeTrial.connection * 0.6 + settlementData.mapping.careerPaths[0].fitScore * 0.4) : Math.round(activeTrial.connection * 0.9), color: "bg-violet-500", bgColor: "bg-violet-100" },
+                        { label: "财富力", icon: "💰", trialVal: activeTrial.wealth, mappedVal: settlementData?.mapping?.careerPaths?.[0]?.fitScore ? Math.round(activeTrial.wealth * 0.8 + settlementData.mapping.careerPaths[0].fitScore * 0.2) : Math.round(activeTrial.wealth * 0.85), color: "bg-amber-500", bgColor: "bg-amber-100" },
+                        { label: "内心安", icon: "🧘", trialVal: activeTrial.peace, mappedVal: settlementData?.mapping?.careerPaths?.[0]?.fitScore ? Math.round(activeTrial.peace * 0.75 + settlementData.mapping.careerPaths[0].fitScore * 0.25) : Math.round(activeTrial.peace * 0.9), color: "bg-emerald-500", bgColor: "bg-emerald-100" },
+                      ].map((dim, idx) => (
+                        <div key={idx}>
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-[10px] font-black text-zinc-600 flex items-center gap-1">
+                              <span className="text-sm">{dim.icon}</span>
+                              {dim.label}
+                            </span>
+                            <div className="flex items-center gap-2 text-[9px] font-bold">
+                              <span className="text-zinc-400">试玩 {dim.trialVal}</span>
+                              <span className="text-zinc-300">→</span>
+                              <span className="text-blue-600">现实 {dim.mappedVal}</span>
+                            </div>
+                          </div>
+                          {/* Double bar comparison */}
+                          <div className="relative h-3 bg-stone-50 rounded-full overflow-hidden border border-stone-100">
+                            <motion.div
+                              initial={{ width: 0 }}
+                              animate={{ width: `${dim.trialVal}%` }}
+                              transition={{ delay: 0.2 + idx * 0.08, duration: 0.5 }}
+                              className="absolute top-0 left-0 h-1.5 bg-stone-300/60 rounded-full"
+                            />
+                            <motion.div
+                              initial={{ width: 0 }}
+                              animate={{ width: `${dim.mappedVal}%` }}
+                              transition={{ delay: 0.3 + idx * 0.08, duration: 0.5 }}
+                              className={`absolute bottom-0 left-0 h-1.5 ${dim.color} rounded-full`}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="flex items-center justify-center gap-4 mt-3 pt-2 border-t border-stone-100">
+                      <span className="text-[9px] text-zinc-400 font-bold flex items-center gap-1">
+                        <span className="w-3 h-1.5 bg-stone-300/60 rounded-full inline-block"></span>
+                        试玩职业
+                      </span>
+                      <span className="text-[9px] text-blue-500 font-bold flex items-center gap-1">
+                        <span className="w-3 h-1.5 bg-blue-500 rounded-full inline-block"></span>
+                        现实映射
+                      </span>
+                    </div>
+
+                    <p className="text-[10px] text-center text-zinc-400 mt-2 italic">
+                      {(() => {
+                        const trialSum = activeTrial.freedom + activeTrial.connection + activeTrial.wealth + activeTrial.peace;
+                        const bestFit = settlementData?.mapping?.careerPaths?.[0]?.fitScore || 75;
+                        const mappedSum = Math.round(activeTrial.freedom * 0.7 + bestFit * 0.3) +
+                          Math.round(activeTrial.connection * 0.6 + bestFit * 0.4) +
+                          Math.round(activeTrial.wealth * 0.8 + bestFit * 0.2) +
+                          Math.round(activeTrial.peace * 0.75 + bestFit * 0.25);
+                        return Math.abs(trialSum - mappedSum) > 15
+                          ? "💡 试玩与现实的差距，正是你可以用行动去缩短的距离"
+                          : "✨ 你的选择和现实高度契合，这条职业路径值得认真考虑";
+                      })()}
+                    </p>
                   </div>
 
                 </div>
@@ -1780,17 +2086,6 @@ export default function App() {
 
         </div>
 
-        {/* iPhone Virtual Home indicator strip */}
-        <div className="w-full h-7 bg-stone-50 dark:bg-zinc-900 border-t border-stone-100 flex items-center justify-center shrink-0 select-none z-30">
-          <div className="w-[120px] h-[4px] bg-zinc-800 dark:bg-zinc-100 rounded-full"></div>
-        </div>
-
-      </div>
-
-      {/* Footer support citation */}
-      <div className="text-center mt-6 text-[11px] text-zinc-500 tracking-tight leading-relaxed max-w-sm pointer-events-none">
-        <p>人生试玩店 (Life Trial) | 先过一天，再做选择</p>
-        <p className="text-zinc-400 font-mono mt-0.5">© 2026 Google AI Studio. Powered with Gemini 3.5 Flash.</p>
       </div>
 
     </div>

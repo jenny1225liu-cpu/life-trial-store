@@ -1,0 +1,23 @@
+{
+  "framework": "vite",
+  "buildCommand": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/map-career",
+      "destination": "/api/map-career"
+    },
+    {
+      "source": "/api/generate-report",
+      "destination": "/api/generate-report"
+    },
+    {
+      "source": "/api/(save-result|results|leaderboard|stats|trials|health)",
+      "destination": "/server"
+    },
+    {
+      "source": "/((?!assets/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

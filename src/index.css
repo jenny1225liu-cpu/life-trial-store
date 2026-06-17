@@ -6,6 +6,11 @@
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
 }
 
+/* Overscroll contain for mobile */
+.overscroll-y-contain {
+  overscroll-behavior-y: contain;
+}
+
 /* Hide scrollbars for movie cards sliders */
 .scrollbar-none::-webkit-scrollbar {
   display: none;
